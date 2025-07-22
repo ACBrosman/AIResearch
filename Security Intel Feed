@@ -1,0 +1,364 @@
+import feedparser
+import html
+import re
+from datetime import datetime, timedelta
+import ollama
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from tqdm import tqdm
+import asyncio
+import concurrent.futures
+from functools import partial
+
+# CONFIG
+rss_feeds = {
+    "CISA": "https://www.cisa.gov/news.xml",
+    "BleepingComputer": "https://www.bleepingcomputer.com/feed/",
+    "HackerNews": "https://hnrss.org/newest?q=security",
+    "ThreatPost": "https://threatpost.com/feed/",
+    "DarkReading": "https://www.darkreading.com/rss.xml",
+}
+keywords = [
+    "AWS", "S3", "IAM", "Azure", "Azure AD", "Microsoft 365", "GitHub",
+    "Cloudflare", "Google Workspace", "CrowdStrike", "SSO", "Zero-Day",
+    "Vulnerability", "Exploit", "Data breach", "Ransomware", "Supply chain"
+]
+cutoff_days = 2
+model_name = "llama3"
+
+# Email config
+GMAIL_SENDER = "ENTER EMAIL HERE"
+GMAIL_PASSWORD = "ENTER PASSWORD"
+GMAIL_RECIPIENT = "ENTER EMAIL HERE"
+
+tech_stack_context = """
+My organization uses the following tech stack:
+
+- Cloud: AWS, GCP, and on-prem infrastructure
+- EDR/AV: CrowdStrike
+- MDM: WorkspaceOne
+- SIEM: Splunk
+- IAM: Okta, CyberArk
+- Network security: Palo Alto (IDS/IPS)
+- Business apps: Salesforce
+
+Based on this stack, please highlight how each issue may affect our environment.
+"""
+
+def fetch_relevant_articles():
+    print("📡 Fetching security news...")
+    relevant_entries = []
+    cutoff = datetime.utcnow() - timedelta(days=cutoff_days)
+
+    for source, url in rss_feeds.items():
+        feed = feedparser.parse(url)
+        for entry in feed.entries:
+            published = entry.get("published_parsed") or entry.get("updated_parsed")
+            if not published:
+                continue
+            entry_time = datetime(*published[:6])
+            if entry_time < cutoff:
+                continue
+            content = f"{entry.title} {entry.get('summary', '')}"
+            if any(keyword.lower() in content.lower() for keyword in keywords):
+                relevant_entries.append({
+                    "source": source,
+                    "title": entry.title,
+                    "link": entry.link,
+                    "summary": html.unescape(re.sub('<[^<]+?>', '', entry.get("summary", ""))),
+                    "published": entry_time.isoformat(),
+                })
+    return relevant_entries
+
+def summarize_with_ollama(article_text, is_executive=False):
+    if is_executive:
+        prompt = f"""Write a 3-4 sentence executive summary for a CISO. Write in second person (you/your organization). Start immediately with the threat information. Do not use any labels, headers, or phrases like "Here's", "Summary:", "Analysis:", etc.
+
+Write natural sentences that blend threat description with organizational impact and recommendations. Reference the tech stack: AWS/GCP, CrowdStrike, Splunk, Okta/CyberArk, Palo Alto, Salesforce.
+
+Articles: {article_text}
+
+Write like: "Today's threat landscape reveals critical vulnerabilities affecting your cloud infrastructure. These attacks could compromise your AWS and GCP environments through compromised IAM credentials. Your CrowdStrike deployment should be configured to detect these specific indicators while Splunk monitoring rules need immediate updates."
+"""
+    else:
+        # Completely rewritten prompt to avoid format artifacts
+        prompt = f"""Analyze this cybersecurity article and respond with a natural paragraph summary.
+
+Start with what happened, then explain the impact on systems, assess if this is high/medium/low risk, and end with 2-3 specific actions to take.
+
+Do not use bullet points, numbered lists, or section headers. Write as flowing sentences.
+
+Tech environment: AWS/GCP cloud, CrowdStrike EDR, Splunk SIEM, Okta/CyberArk IAM, Palo Alto firewalls, Salesforce.
+
+Article: {article_text[:400]}
+
+Write a natural summary paragraph."""
+    
+    try:
+        response = ollama.chat(
+            model=model_name, 
+            messages=[{"role": "user", "content": prompt}],
+            options={
+                "temperature": 0.3,  # Lower temperature for more consistent output
+                "top_p": 0.9,
+                "repeat_penalty": 1.1
+            }
+        )
+        return response['message']['content'].strip()
+    except Exception as e:
+        print(f"⚠️ Ollama error: {e}")
+        return "Unable to generate summary at this time."
+
+def clean_ai_text(text):
+    """Aggressively clean AI-generated artifacts"""
+    # Remove common AI response patterns and formatting artifacts
+    patterns_to_remove = [
+        r"(?i)^(here's|here is|here are)\s+.*?[:：]\s*",
+        r"(?i)^(a\s+)?(structured\s+)?(response|analysis|summary).*?[:：]\s*",
+        r"(?i)^(based on|analyzing|looking at).*?[:：]\s*",
+        r"(?i)(summary|analysis)[:：]\s*",
+        r"(?i)(impacted systems|affected systems|risk level|recommended actions?)[:：]\s*",
+        r"(?i)for (the\s+)?tech stack[:：]\s*",
+        r"(?i)^the\s+article\s+",
+        r"(?i)^this\s+(article|vulnerability|threat)\s+",
+        r"(?i)one sentence summary.*?[:：]\s*",
+        r"(?i)actions for.*?[:：]\s*",
+        r"(?i)^(high|medium|low)\s*$",  # Remove standalone risk levels
+        r"\*+",  # Remove asterisks
+        r"(?i)please note.*$",
+        r"(?i)note[:：].*$",
+        r"(?i)in summary.*$",
+        r"(?i)to conclude.*$"
+    ]
+    
+    for pattern in patterns_to_remove:
+        text = re.sub(pattern, "", text, flags=re.MULTILINE | re.DOTALL)
+    
+    # Clean up whitespace and line breaks
+    text = re.sub(r'\n\s*\n', ' ', text)  # Convert multiple newlines to spaces
+    text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+    text = text.strip()
+    
+    # Ensure first letter is capitalized
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
+    
+    return text
+
+def process_article(article):
+    """Process a single article - for parallel processing"""
+    summary_text = article['summary'][:300] if len(article['summary']) > 300 else article['summary']
+    combined_text = f"{article['title']}\n{summary_text}"
+    
+    ai_summary = summarize_with_ollama(combined_text)
+    ai_summary = clean_ai_text(ai_summary)
+    
+    risk = extract_risk_level(ai_summary)
+    
+    return {
+        "title": article["title"],
+        "source": article["source"],
+        "date": article["published"],
+        "link": article["link"],
+        "summary": ai_summary,
+        "risk": risk,
+    }
+
+def extract_risk_level(summary):
+    # Look for risk indicators in the text content, not standalone words
+    summary_lower = summary.lower()
+    
+    # High risk indicators
+    high_indicators = [
+        "zero-day", "zero day", "0-day", "critical", "severe", "ransomware", 
+        "data breach", "rce", "remote code execution", "actively exploited",
+        "no patch", "patch not available", "emergency", "immediate"
+    ]
+    
+    # Low risk indicators  
+    low_indicators = [
+        "informational", "advisory", "update available", "patch available",
+        "mitigated", "fixed", "resolved", "low impact"
+    ]
+    
+    # Count high and low risk indicators
+    high_score = sum(1 for indicator in high_indicators if indicator in summary_lower)
+    low_score = sum(1 for indicator in low_indicators if indicator in summary_lower)
+    
+    if high_score >= 2 or any(critical in summary_lower for critical in ["zero-day", "actively exploited", "no patch"]):
+        return "High"
+    elif low_score > high_score:
+        return "Low"
+    else:
+        return "Medium"
+
+def format_article_content(summary):
+    """Format the article summary for HTML display as clean paragraphs"""
+    # Clean the summary first
+    summary = clean_ai_text(summary)
+    
+    # Split into sentences and create readable paragraphs
+    sentences = [s.strip() for s in summary.split('.') if s.strip()]
+    
+    if len(sentences) <= 2:
+        # Short summary - single paragraph
+        return f"<p>{summary}</p>"
+    else:
+        # Longer summary - break into logical paragraphs
+        formatted_content = ""
+        current_paragraph = []
+        
+        for sentence in sentences:
+            current_paragraph.append(sentence)
+            
+            # Create paragraph breaks at logical points
+            if len(current_paragraph) >= 2 or any(word in sentence.lower() for word in ['however', 'additionally', 'meanwhile', 'therefore']):
+                paragraph_text = '. '.join(current_paragraph) + '.'
+                formatted_content += f"<p>{paragraph_text}</p>"
+                current_paragraph = []
+        
+        # Add remaining sentences
+        if current_paragraph:
+            paragraph_text = '. '.join(current_paragraph) + '.'
+            formatted_content += f"<p>{paragraph_text}</p>"
+        
+        return formatted_content
+
+def generate_html_email(articles):
+    print("🧠 Summarizing articles and generating email body...")
+
+    # Process articles in parallel with reduced workers to avoid overwhelming Ollama
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        summaries = list(tqdm(
+            executor.map(process_article, articles), 
+            total=len(articles), 
+            desc="Summarizing"
+        ))
+
+    # Sort by risk level and limit to top 5
+    risk_priority = {"High": 1, "Medium": 2, "Low": 3}
+    summaries.sort(key=lambda x: risk_priority.get(x['risk'], 2))
+    summaries = summaries[:5]
+
+    print("📈 Generating executive summary...")
+
+    # Create executive summary
+    high_risk_count = len([s for s in summaries if s['risk'] == 'High'])
+    medium_risk_count = len([s for s in summaries if s['risk'] == 'Medium'])
+    
+    # Create a consolidated text for executive summary
+    summary_text = "\n".join([f"{s['title']}: {s['summary'][:100]}" for s in summaries[:3]])
+    
+    executive_summary = summarize_with_ollama(summary_text, is_executive=True)
+    executive_summary = clean_ai_text(executive_summary)
+
+    # Get high-risk articles for the high-risk section
+    high_risk_articles = [s for s in summaries if s['risk'] == 'High']
+
+    html_content = f"""
+    <html>
+    <head>
+      <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.4; }}
+        .high {{ color: #a80000; font-weight: bold; }}
+        .medium {{ color: #d17b00; font-weight: bold; }}
+        .low {{ color: #007500; font-weight: bold; }}
+        .article {{ margin-bottom: 24px; border-bottom: 1px solid #eee; padding-bottom: 16px; }}
+        .meta {{ font-size: 0.9em; color: #555; margin-bottom: 8px; }}
+        .risk-badge {{ 
+          display: inline-block; 
+          padding: 3px 8px; 
+          border-radius: 4px; 
+          font-size: 0.8em; 
+          font-weight: bold; 
+          margin-left: 8px;
+        }}
+        .risk-high {{ background-color: #ffebee; color: #c62828; }}
+        .risk-medium {{ background-color: #fff3e0; color: #f57c00; }}
+        .risk-low {{ background-color: #e8f5e8; color: #2e7d32; }}
+        .summary-box {{ 
+          background: #f8f9fa; 
+          padding: 16px; 
+          border-left: 4px solid #007acc; 
+          margin-bottom: 24px;
+        }}
+      </style>
+    </head>
+    <body>
+    <h1>Daily InfoSec Digest – {datetime.utcnow().strftime('%B %d, %Y')}</h1>
+    
+    <div class="summary-box">
+    <h3>Executive Summary</h3>
+    <p>{executive_summary}</p>
+    </div>
+
+    <h2>🚨 High-Risk Issues ({high_risk_count})</h2>
+    """
+
+    if high_risk_articles:
+        html_content += "<ul>"
+        for article in high_risk_articles:
+            html_content += f"<li><strong>{article['title']}</strong> ({article['source']})</li>"
+        html_content += "</ul>"
+    else:
+        html_content += "<p>✅ No high-risk issues found today.</p>"
+
+    html_content += "<hr><h2>📊 Top Security Issues</h2>"
+
+    for item in summaries:
+        formatted_content = format_article_content(item['summary'])
+        
+        html_content += f"""
+        <div class="article">
+            <h3>{item['title']}<span class="risk-badge risk-{item['risk'].lower()}">{item['risk']} Risk</span></h3>
+            <div class="meta">
+                <strong>{item['source']}</strong> • {datetime.fromisoformat(item['date']).strftime('%Y-%m-%d %H:%M')}
+                <br><a href="{item['link']}">Read full article →</a>
+            </div>
+            {formatted_content}
+        </div>
+        """
+
+    html_content += "</body></html>"
+    return html_content
+
+def send_email(html_content):
+    subject = f"Daily InfoSec Digest - {datetime.utcnow().strftime('%m/%d/%Y')}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = GMAIL_SENDER
+    msg["To"] = GMAIL_RECIPIENT
+    msg.attach(MIMEText(html_content, "html"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(GMAIL_SENDER, GMAIL_PASSWORD)
+            server.sendmail(GMAIL_SENDER, GMAIL_RECIPIENT, msg.as_string())
+        print("✅ Email sent successfully.")
+    except Exception as e:
+        print("❌ Failed to send email:", str(e))
+
+# MAIN
+if __name__ == "__main__":
+    print(f"🚀 Starting InfoSec Digest - {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    
+    articles = fetch_relevant_articles()
+    print(f"📎 Found {len(articles)} relevant articles.")
+    
+    if not articles:
+        print("ℹ️ No relevant articles today.")
+    else:
+        html_digest = generate_html_email(articles)
+        
+        # Save local copy
+        output_file = f"security_digest_{datetime.utcnow().strftime('%Y%m%d')}.html"
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(html_digest)
+        print(f"✅ HTML digest saved to {output_file}")
+        
+        print("✉️ Sending email...")
+        send_email(html_digest)
+    
+    print("🏁 Process completed!")
